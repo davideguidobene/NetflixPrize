@@ -1,0 +1,350 @@
+---
+title: "SNAProjectNetflixPrize"
+author: "Davide Guidobene"
+date: "9/1/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+rm(list = ls())
+set.seed(76418)
+```
+
+#libraries
+```{r}
+library(lubridate)
+library(dplyr)
+library(zoo)
+library(recosystem)
+library(Matrix)
+library(ggplot2)
+library(igraph)
+```
+
+
+#Utility functions
+```{r}
+plot_deg_distr <- function(g, node_type){
+  G.degrees <- degree(g, V(g)[V(g)$type==node_type])
+  G.degree.histogram <- as.data.frame(table(G.degrees))
+  G.degree.histogram[,1] <- as.numeric(G.degree.histogram[,1])
+  if(node_type)
+    type_name = "Users"
+  else
+    type_name = "Movies"
+  ggplot(G.degree.histogram, aes(x = G.degrees, y = Freq)) +
+      geom_point() +
+      scale_x_continuous("Degree\n(nodes with this amount of connections)",
+                         breaks = c(1, 3, 10, 30, 100, 300),
+                         trans = "log10") +
+      scale_y_continuous("Frequency\n(how many of them)",
+                         breaks = c(1, 3, 10, 30, 100, 300, 1000),
+                         trans = "log10") +
+      ggtitle(paste(type_name, "Degree Distribution (log-log)")) +
+      theme_bw()
+}
+
+get_users <- function(g) {
+  return (V(g)[V(g)$type==T])
+}
+
+get_movies <- function(g) {
+  return (V(g)[V(g)$type==F])
+}
+```
+
+
+#DATA PREPARATION -- TRAINING DATA
+```{r}
+setwd("C:/Users/david/OneDrive/Desktop/ProgettoSNA")
+nf <- read.table("Data/combined_data.txt",sep=",",header=FALSE,fill=TRUE)
+head(nf)
+
+# this is how the data looks like - In this preview, "1:" is the movie ID, and the rows that come after ("1488844", "822109", etc) are the user ID. 
+# generally, the indicator of rows which contain the movie ID lies in the presence of ":". 
+# V2 is the rating data
+# V3 is the date on which the rating was given for a certain movie ID
+```
+
+#In order to be interpretable, the above format has to be transformed into the data frame which contains these columns: Movie ID, User ID, Rating, and Date
+```{r}
+nf$V4 <- nf$V1 #creating 2 separate columns, V1 will be dedicated for Movie ID, while V4 will be dedicated for User ID
+nf$V1[!grepl(":",nf$V1)] <- NA #if the V1 column does NOT contain ":", it will be changed into NA
+nf$V1 <- gsub(":","",nf$V1) #replacing the ":" with "" -- this function is basically aimed at removing the ":" character in the movie ID
+nf$V1 <- na.locf(nf$V1) #Replaces each missing value (the NAs) with the most recent present value prior to it (Last Observation Carried Forward) -- that is, the most recent "Movie ID" prior to it
+nf <- filter(nf,!grepl(":",nf$V4)) #removing the rows containing ":" in the V4 column from the observation
+nf <- nf[,c("V1","V4","V2","V3")] #restructuring the order of the columns
+names(nf) <- c("movie_id", "user_id","rating","date")
+
+head(nf)
+```
+
+```{r}
+str(nf) #checking the data type of each column
+nf$movie_id <- as.numeric(nf$movie_id)
+nf$user_id <- as.numeric(nf$user_id)
+
+nf$rating <- as.numeric(nf$rating)
+nf$date <- as.Date(nf$date, "%Y-%m-%d")
+summary(nf)
+head(nf)
+```
+
+#Netflix rating method changed in 2004
+```{r}
+mean_rating = nf %>%
+  group_by(year(date)) %>%
+  summarize(mean_rating = mean(rating))
+ggplot(mean_rating, aes(`year(date)`, mean_rating)) +
+      geom_point() +
+      scale_x_continuous(breaks = mean_rating$`year(date)`) +
+      scale_y_continuous(breaks = seq(from=3, to=4, by=0.1)) +
+      ggtitle("Average rating by year") +
+      theme_bw()
+#Since in 2004 Netflix changed the text accompanying the star ratings changed from an objective scale (excellent, good, fair, …) to a subjective scale (loved it, liked it, …), the average rating of the audience showed a significant improvement.
+#For this reason I decided to either keep all the reviews either before or after that year.
+sum(year(nf$date)<2004)
+sum(year(nf$date)>2004)
+#Since the reviews after 2004 are significantly more and the only relevant ones to predict future data, I decided to keep those
+nf <- nf[year(nf$date)>2004,]
+head(nf)
+summary(nf)
+```
+
+#Let's make sure movie_id and user_id don't have any common label
+```{r}
+nf$movie_id <- match(nf$movie_id, unique(nf$movie_id))
+nf$user_id <- max(nf$movie_id)+match(nf$user_id, unique(nf$user_id))
+
+intersect(nf$movie_id, nf$user_id)
+summary(nf)
+```
+
+#CREATION BIPARTITE GRAPH (users-movies)
+```{r}
+edges <- with(nf, data.frame("from"=user_id, "to"=movie_id, "weight"=rating, stringsAsFactors = F))
+head(edges)
+
+g <- graph.data.frame(edges, directed = F)
+g <- simplify(g)
+V(g)$type <- V(g)$name %in% edges[, 1]
+```
+
+```{r}
+#We assign color orange to nodes movie and color blue to nodes user
+V(g)$color <- V(g)$type
+V(g)$color=gsub("FALSE","orange",V(g)$color)
+V(g)$color=gsub("TRUE","blue",V(g)$color)
+
+#We assign a different color to edges that represent a different rating
+E(g)$color <- E(g)$weight
+E(g)$color <- gsub(1, "yellow", E(g)$color)
+E(g)$color <- gsub(2, "deeppink", E(g)$color)
+E(g)$color <- gsub(3, "red", E(g)$color)
+E(g)$color <- gsub(4, "green", E(g)$color)
+E(g)$color <- gsub(5, "darkviolet", E(g)$color)
+```
+
+
+#LET'S ANALYSE THE DEGREE DISTRIBUTION OF THE 2 SET OF NODES (users and movies)
+```{r}
+plot_deg_distr(g, T) #deg_distr users
+plot_deg_distr(g, F) #deg_distr movies
+```
+
+#Let's visualize g
+```{r}
+reduced_graph <- g
+
+y <- length(get_users(reduced_graph))
+new_users <- sample(get_users(g), y^sqrt(4.1/10))
+
+x <- length(get_movies(reduced_graph))
+new_movies <- sample(get_movies(g), x^(4.1/10))
+
+reduced_graph <- reduced_graph <- induced_subgraph(reduced_graph, c(new_users, new_movies))
+  
+reduced_graph <- delete.vertices(reduced_graph, V(reduced_graph)[degree(reduced_graph)==0])
+```
+
+```{r}
+plot(reduced_graph,
+       vertex.label=NA, 
+       edge.size = 0.01,
+       edge.lty = 2,
+       vertex.size = 0.8,
+       layout=layout_as_bipartite)
+```
+
+
+#Here we divide the graph in 5 subragphs based on the weight
+```{r}
+weights <- E(reduced_graph)$weight
+subg <- list()
+for (r in seq(5)) {
+  subg[[r]] <- delete.edges(reduced_graph, E(reduced_graph)[weights!=r])
+  subg[[r]] <- delete.vertices(subg[[r]], 
+                                    V(subg[[r]])[degree(subg[[r]])==0])
+}
+```
+
+```{r}
+for (r in seq(5)) {
+  print(plot(subg[[r]],
+       vertex.label=NA, 
+       edge.size = 0.1,
+       edge.lty = 2,
+       vertex.size = 3,
+       weights = F,
+       layout=layout_as_bipartite))
+}
+```
+
+#BIPARTITE PROJECTION ON USERS
+```{r}
+y <- length(get_users(g))
+rug <- induced_subgraph(g, c(sample(new_users, y^(3.33/10)), get_movies(g)))
+rug <- delete.vertices(rug, V(rug)[degree(rug)==0])
+```
+
+#Bipartite projection on user for each subgraph
+```{r}
+weights <- E(rug)$weight
+pu <- list() ##proj users
+for (r in seq(5)) {
+  pu[[r]] <- delete.edges(rug, E(rug)[weights!=r])
+  pu[[r]] <- delete.vertices(pu[[r]], V(pu[[r]])[degree(pu[[r]])==0])
+  a = as_incidence_matrix(pu[[r]])
+  im_g_proj_user <- t(a)%*%a #proj users
+  pu[[r]] <- graph_from_adjacency_matrix(im_g_proj_user, mode="undirected", weighted = T)
+  pu[[r]] <- simplify(pu[[r]])
+  pu[[r]] <- delete.vertices(pu[[r]], V(pu[[r]])[degree(pu[[r]])==0])
+}
+```
+
+```{r}
+for (r in seq(5)) {
+  print(plot(pu[[r]],
+       vertex.label=NA,
+       edge.lty = 1,
+       vertex.size = 4,
+       vertex.color = "blue",
+       edge.size = 0.1,
+       edge.width = E(pu[[r]])$weight/10,
+       edge.color = "black",
+       layout = layout_in_circle
+       ))
+}
+```
+
+#Union on the projections
+```{r}
+dfu = do.call(
+      rbind,
+      lapply(pu, get.data.frame)
+      )
+dfu <- aggregate(weight~ ., dfu, sum)
+upu <- graph_from_data_frame(dfu, directed = F)
+
+plot(upu,
+       vertex.label=NA, 
+       edge.size = 0.1,
+       edge.lty = 1,
+       vertex.size = 4,
+       vertex.color = "blue",
+       edge.width=E(upu)$weight/10,
+       edge.color="black",
+       layout = layout_in_circle)
+```
+
+#clustering
+```{r}
+cl_upu = cluster_fast_greedy(upu)
+
+plot(cl_upu, upu, 
+     vertex.label = NA,
+     vertex.size = 6,
+     edge.size = 0.1,
+     edge.lty = 1,
+     edge.curved = TRUE,
+     edge.width=E(upu)$weight/10,
+     layout = layout_with_fr(upu)
+     #layout=layout.circle(upu)
+     )
+```
+
+#BIPARTITE PROJECTION ON MOVIES
+```{r}
+y <- length(get_movies(g))
+rmg <- induced_subgraph(g, c(new_movies, get_users(g)))
+rmg <- delete.vertices(rmg, V(rmg)[degree(rmg)==0])
+```
+
+#Bipartite projection on movies for each subgraph
+```{r}
+weights <- E(rmg)$weight
+pm <- list() #proj movies
+for (r in seq(5)) {
+  pm[[r]] <- delete.edges(rmg, E(rmg)[weights!=r])
+  pm[[r]] <- delete.vertices(pm[[r]], V(pm[[r]])[degree(pm[[r]])==0])
+  a = as_incidence_matrix(pm[[r]])
+  im_g_proj_movie <- a%*%t(a) #proj movies
+  #pm[[r]] <- bipartite_projection(pm[[r]], multiplicity = T)$proj1
+  pm[[r]] <- graph_from_adjacency_matrix(im_g_proj_movie, mode="undirected", weighted = T)
+  pm[[r]] <- simplify(pm[[r]])
+  pm[[r]] <- delete.vertices(pm[[r]], V(pm[[r]])[degree(pm[[r]])==0])
+}
+```
+
+```{r}
+for (r in seq(5)) {
+  print(plot(pm[[r]],
+       vertex.label=NA, 
+       edge.size = 0.1,
+       edge.lty = 1,
+       vertex.size = 4,
+       edge.width=E(pm[[r]])$weight/100,
+       edge.color = "black",
+       layout = layout_in_circle))
+}
+```
+
+#Union of the projections
+```{r}
+dfm = do.call(
+      rbind,
+      lapply(pm, get.data.frame)
+      )
+dfm <- aggregate(weight~ ., dfm, sum)
+upm <- graph_from_data_frame(dfm, directed = F)
+plot(upm,
+       vertex.label=NA, 
+       edge.size = 0.1,
+       edge.lty = 1,
+       vertex.size = 4,
+       edge.width=E(upm)$weight/100,
+       edge.color = "black",
+       layout = layout_in_circle)
+```
+
+#Clustering
+```{r}
+cl_upm = cluster_fast_greedy(upm)
+
+plot(cl_upm, upm, 
+     vertex.label = NA,
+     vertex.size = 6,
+     edge.size = 0.1,
+     edge.lty = 1,
+     edge.curved = TRUE,
+     edge.width = E(upm)$weight/100,
+     layout = layout_with_fr(upm)
+     #layout=layout.circle(upm)
+     )
+```
+
+
