@@ -60,7 +60,8 @@ get_movies <- function(g) {
 
 #DATA PREPARATION -- TRAINING DATA
 ```{r}
-setwd("C:/Users/david/OneDrive/Desktop/ProgettoSNA")
+path <- "C:/Users/david/OneDrive/Desktop/New"
+setwd(path)
 nf <- read.table("Data/combined_data.txt",sep=",",header=FALSE,fill=TRUE)
 head(nf)
 
@@ -105,7 +106,26 @@ ggplot(mean_rating, aes(`year(date)`, mean_rating)) +
       scale_y_continuous(breaks = seq(from=3, to=4, by=0.1)) +
       ggtitle("Average rating by year") +
       theme_bw()
+
+ggplot(mean_rating, aes(`year(date)`, mean_rating)) +
+      geom_point() +
+      scale_x_continuous(breaks = mean_rating$`year(date)`) +
+      scale_y_continuous(breaks = seq(from=1, to=5, by=0.1), limits = c(1, 5)) +
+      ggtitle("Average rating by year") +
+      theme_bw()
+
+for (yr in min(year(nf$date)) : max(year(nf$date))) {
+  print(ggplot(nf[year(nf$date) == yr,], aes(x = rating)) +
+    geom_histogram(aes(y =..density..),
+                   bins = 9) +
+      scale_y_continuous(limits = c(0, 1)) +
+    ggtitle(paste("Rating distribution in ", yr))
+  )
+}
 #Since in 2004 Netflix changed the text accompanying the star ratings changed from an objective scale (excellent, good, fair, …) to a subjective scale (loved it, liked it, …), the average rating of the audience showed a significant improvement.
+```
+
+```{r}
 #For this reason I decided to either keep all the reviews either before or after that year.
 sum(year(nf$date)<2004)
 sum(year(nf$date)>2004)
@@ -117,8 +137,9 @@ summary(nf)
 
 #Let's make sure movie_id and user_id don't have any common label
 ```{r}
-nf$movie_id <- match(nf$movie_id, unique(nf$movie_id))
-nf$user_id <- max(nf$movie_id)+match(nf$user_id, unique(nf$user_id))
+#nf$movie_id <- match(nf$movie_id, unique(nf$movie_id))
+user_id_offset <- max(nf$movie_id)
+nf$user_id <- user_id_offset + match(nf$user_id, unique(nf$user_id))
 
 intersect(nf$movie_id, nf$user_id)
 summary(nf)
@@ -178,6 +199,18 @@ plot(reduced_graph,
        edge.lty = 2,
        vertex.size = 0.8,
        layout=layout_as_bipartite)
+legend(x = "topright",                                              # Position
+       legend = c(1, 2, 3, 4, 5),                                   # Legend texts
+       col = c("yellow", "deeppink", "red", "green", "darkviolet"), # Line colors
+       lwd = 2,                                                     # Line width
+       title = "edges"
+       )
+legend(x = "bottomright",
+       legend = c('user', 'movie'),
+       col = c("blue", "orange"),
+       pch = 'o',
+       title = "nodes"
+       )
 ```
 
 
@@ -347,4 +380,164 @@ plot(cl_upm, upm,
      )
 ```
 
+#HOMOPHILY
+```{r}
+#we get a sample of movies with genre (obtained in the jupyter notebook file trhough API)
+setwd(path)
+sample_movie_titles <- read.csv("df/sample_movie_titles.csv")
+head(sample_movie_titles)
+```
 
+
+```{r}
+#Now we repeat the whole clustering process on the new sample of movies
+new_movies <- get_movies(g)[as.numeric(get_movies(g)$name) %in% sample_movie_titles$movie_id]
+
+y <- length(get_movies(g))
+rmg <- induced_subgraph(g, c(new_movies, get_users(g)))
+rmg <- delete.vertices(rmg, V(rmg)[degree(rmg)==0])
+
+weights <- E(rmg)$weight
+pm <- list() #proj movies
+for (r in seq(5)) {
+  pm[[r]] <- delete.edges(rmg, E(rmg)[weights!=r])
+  pm[[r]] <- delete.vertices(pm[[r]], V(pm[[r]])[degree(pm[[r]])==0])
+  a = as_incidence_matrix(pm[[r]])
+  im_g_proj_movie <- a%*%t(a) #proj movies
+  #pm[[r]] <- bipartite_projection(pm[[r]], multiplicity = T)$proj1
+  pm[[r]] <- graph_from_adjacency_matrix(im_g_proj_movie, mode="undirected", weighted = T)
+  pm[[r]] <- simplify(pm[[r]])
+  pm[[r]] <- delete.vertices(pm[[r]], V(pm[[r]])[degree(pm[[r]])==0])
+}
+
+dfm = do.call(
+      rbind,
+      lapply(pm, get.data.frame)
+      )
+dfm <- aggregate(weight~ ., dfm, sum)
+upm <- graph_from_data_frame(dfm, directed = F)
+
+cl_upm = cluster_fast_greedy(upm)
+```
+
+```{r}
+movies <- merge(sample_movie_titles,
+                data.frame(movie_id = cl_upm$names,
+                           clustering_membership = cl_upm$membership),
+                by="movie_id")
+movies <- movies[order(movies$clustering_membership), ]
+rownames(movies) <- 1:nrow(movies)
+movies
+```
+
+#Homophily among movies based on the year of release
+```{r}
+#first we compare the expected absolute value of the difference of years among two movies linked by an edge if the graph was random: E(abs(u1$year - u2$year) | G.israndom), with the actual average in this graph: mean(abs(u1$year - u2$year))
+
+n_of_nodes <- length(V(upm))
+
+exp_diff <- 0
+for (y in movies$year_of_release) {
+  for (k in movies$year_of_release) {
+    exp_diff <- exp_diff + abs(y-k)
+  }
+}
+exp_diff <- exp_diff/(n_of_nodes)/(n_of_nodes - 1)
+exp_diff #E(abs(u1$year - u2$year) | G.israndom)
+
+upm_edges <- get.edgelist(upm)
+n_of_edges <- nrow(upm_edges) #total number of edges
+
+year_diffs <- numeric(n_of_edges)
+for (i in 1:n_of_edges) {
+  m_id1 <- as.numeric(upm_edges[i, 1])
+  m_id2 <- as.numeric(upm_edges[i, 2])
+  year_diffs[i] <- abs(movies[movies$movie_id == m_id1, "year_of_release"]
+                             - movies[movies$movie_id == m_id2, "year_of_release"])
+}
+mean(year_diffs) #mean(abs(u1$year - u2$year))
+sd(year_diffs)
+```
+#The actual year difference among neighbours is lower than the theorical difference but not very significantly
+
+```{r}
+#Now let's compare the variance of the years of release in the whole dataframe with the variance in the single clusters
+
+year_variance <- numeric(length(unique(movies$clustering_membership)))
+print(var(movies$year_of_release))
+for (i in unique(movies$clustering_membership)) {
+  year_variance[i] <- var(movies$year_of_release[movies$clustering_membership == i])
+}
+print(year_variance)
+print(mean(year_variance))
+print(sd(year_variance))
+```
+#We notice that the cluster have on average a quite smaller variance (with the exception of the first cluster)
+
+```{r}
+#Let's see the average year of each cluster
+year_mean <- numeric(length(unique(movies$clustering_membership)))
+print(mean(movies$year_of_release))
+for (i in unique(movies$clustering_membership)) {
+  year_mean[i] <- mean(movies$year_of_release[movies$clustering_membership == i])
+}
+print(year_mean)
+```
+
+```{r}
+ggplot(movies, aes(y=year_of_release)) +
+  geom_boxplot() +
+  ggtitle("movies year of release")
+ggplot(movies, aes(x=factor(clustering_membership), y=year_of_release)) +
+  geom_boxplot() +
+  ggtitle("movies year of release per cluster")
+```
+
+
+#Homophily among movies of the same genre
+```{r}
+genres <- unique(movies$genre)
+n_of_nodes_per_genre <- numeric(length(genres))
+for (i in 1:length(genres)){
+  n_of_nodes_per_genre[i] <- nrow(movies[movies$genre == genres[i], ])
+}
+```
+
+```{r}
+#Similarly to what we did for the year of release we want to compare:
+# - the probability p of a random edge to link 2 movies of the same genre if the graph was random
+# - the actual probability d of a random edge to link 2 movies of the same genre
+p = 0
+for (i in 1:length(genres)){
+  p = p + (n_of_nodes_per_genre[i]/n_of_nodes) * ((n_of_nodes_per_genre[i]-1)/n_of_nodes)
+}
+p # probability of a random edge to link 2 movies of the same genre if the graph was random
+
+d = 0
+for (i in 1:length(genres)){
+  d = d + sum((as.numeric(upm_edges[, 1]) %in% movies[movies$genre == genres[i], "movie_id"]) & (as.numeric(upm_edges[, 2]) %in% movies[movies$genre == genres[i], "movie_id"])) / n_of_edges
+}
+d # actual probability of a random edge to link 2 movies of the same genre
+```
+#the number of links among movies of the same genre is slightly greater than the expected number, but not significantly so
+
+```{r}
+d_per_cluster <- numeric(length(unique(movies$clustering_membership)))
+for (i in unique(movies$clustering_membership)) {
+  d_per_cluster[i] <- 0
+  nodes_in_cluster <- movies[movies$clustering_membership == i,]
+  n_of_nodes_in_cluster <- nrow(nodes_in_cluster)
+  for (n in nodes_in_cluster$movie_id){
+    for (m in nodes_in_cluster$movie_id) {
+      if (m != n & movies[movies$movie_id == m, "genre"] == movies[movies$movie_id == n, "genre"]) {
+        d_per_cluster[i] <- d_per_cluster[i] + 1
+      }
+    }
+  }
+  d_per_cluster[i] <- d_per_cluster[i]/n_of_nodes_in_cluster/(n_of_nodes_in_cluster-1)
+}
+d_per_cluster
+mean(d_per_cluster)
+```
+#On average we notice that the movies that end up in the same cluster are not more likely to be of the same genre.
+#We can thereby conclude that there is no evidence of homophily per genre among movies
